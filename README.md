@@ -1,6 +1,6 @@
 <h1>🛢 VaultNET</h1>
 
-VaultNET is a lightweight local file vault that lets you upload, browse, and download files from your own machine.
+VaultNET is a lightweight local file server that lets you upload, browse, and download files from your own machine.
 It is designed for personal use on a home or small LAN without relying on cloud services.
 
 <h2>🚀 Features</h2>
