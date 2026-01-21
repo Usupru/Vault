@@ -16,9 +16,15 @@ It is designed for personal use on a home or small LAN without relying on cloud 
 
 <h3>Make sure you have Node.js and npm installed.</h3>
 
-Clone the repository (or copy the folder) and go to the backend:
+First, clone the repository:
 ````
-cd VaultNET\backend
+git clone https://github.com/Usupru/Vault.git
+cd VaultNET
+````
+
+Navigate to the backend folder
+````
+cd backend
 ````
 
 Install dependencies:
