@@ -26,7 +26,7 @@ Install dependencies:
 npm install
 ````
 
-<h2>?? Usage</h2>
+<h2>⚙️ Usage</h2>
 
 Start the server:
 ````
