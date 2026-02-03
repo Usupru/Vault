@@ -11,7 +11,8 @@ It is designed for personal use on a home or small LAN without relying on cloud 
 <li>♾️ Limitless own local storage</li>
 <li>🔒 Maximum privacy</li>
 <li>💻 User-friendly interface</li>
-<li>🔍 Excelent filtering system</li>
+<li>🔍 Filtering system</li>
+<li>🛢 SQL integration</li>
 </ul>
 
 <h2>📦 Installation</h2>
