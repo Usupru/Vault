@@ -3,40 +3,27 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const session = require('express-session');
-
 const archiver = require('archiver');
 const { execSync } = require('child_process');
+const { initDatabase } = require('./db');
 
 const app = express();
-
-
-// Configuracion de express-session
+let db = null;
 
 app.use(session({
-
   secret: 'mi_secreto',
-
   resave: false,
-
   saveUninitialized: true
-
 }));
 
-
-
-
-// Middleware para leer los datos de la solicitud
 app.use(express.urlencoded({ extended: true }));
 
-// Configuraci�n de multer para manejar las subidas de archivos
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadPath = path.join(__dirname, 'uploads');
-
     if (!fs.existsSync(uploadPath)) {
       fs.mkdirSync(uploadPath, { recursive: true });
     }
-
     cb(null, uploadPath);
   },
   filename: (req, file, cb) => {
@@ -44,10 +31,7 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({
-  storage: storage,
-  limits: { fileSize: 25 * 1024 * 1024 }
-});
+const upload = multer({ storage });
 
 const escapeHtml = (value) => (
   String(value ?? '')
@@ -100,58 +84,50 @@ const getDiskFreeSpace = () => {
   }
 };
 
-const getUploadedFileCount = () => {
-  const uploadsFolder = path.join(__dirname, 'uploads');
-  if (!fs.existsSync(uploadsFolder)) {
-    return 0;
+const getUploadedFileCount = async () => {
+  const result = await db.get('SELECT COUNT(*) AS total FROM entry_files');
+  return Number(result?.total || 0);
+};
+
+const getEntryWithFiles = async (id) => {
+  const entry = await db.get(
+    'SELECT id, created_at, title, description, category FROM entries WHERE id = ?',
+    id
+  );
+
+  if (!entry) {
+    return null;
   }
 
-  return fs.readdirSync(uploadsFolder).reduce((count, entry) => {
-    if (entry === 'metadata') {
-      return count;
-    }
+  const files = await db.all(
+    `SELECT file_path AS path, file_name AS filename
+     FROM entry_files
+     WHERE entry_id = ?
+     ORDER BY sort_order ASC, id ASC`,
+    id
+  );
 
-    const entryPath = path.join(uploadsFolder, entry);
-    try {
-      return fs.statSync(entryPath).isFile() ? count + 1 : count;
-    } catch (error) {
-      return count;
-    }
-  }, 0);
+  return {
+    id: entry.id,
+    createdAt: entry.created_at,
+    title: entry.title,
+    description: entry.description,
+    category: entry.category,
+    files
+  };
 };
 
-const renderIndex = (res) => {
-  const indexTemplate = path.join(__dirname, 'public', 'index.html');
-  const freeSpace = getDiskFreeSpace();
-  const fileCount = getUploadedFileCount();
+const removeEntry = async (id) => {
+  const files = await db.all(
+    'SELECT file_path AS path FROM entry_files WHERE entry_id = ?',
+    id
+  );
 
-  fs.readFile(indexTemplate, 'utf8', (err, html) => {
-    if (err) {
-      return res.status(500).send('<h1>Error al cargar la p�gina</h1>');
-    }
-
-    const updatedHtml = html
-      .replace('{{FREE_SPACE}}', freeSpace === null ? 'N/D' : formatBytes(freeSpace))
-      .replace('{{FILE_COUNT}}', `${fileCount}`);
-
-    res.send(updatedHtml);
-  });
-};
-
-const removeEntry = (id) => {
-  const metadataFile = path.join(__dirname, 'uploads', 'metadata', `${id}.json`);
-  if (!fs.existsSync(metadataFile)) {
+  const deleted = await db.run('DELETE FROM entries WHERE id = ?', id);
+  if (!deleted?.changes) {
     return false;
   }
 
-  let metadata;
-  try {
-    metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
-  } catch (error) {
-    return false;
-  }
-
-  const files = Array.isArray(metadata.files) ? metadata.files : [];
   files.forEach((file) => {
     if (!file?.path) {
       return;
@@ -162,26 +138,36 @@ const removeEntry = (id) => {
         fs.unlinkSync(filePath);
       }
     } catch (error) {
-      // Ignore delete errors to continue processing others.
+      // Continue deleting the rest.
     }
   });
-
-  try {
-    fs.unlinkSync(metadataFile);
-  } catch (error) {
-    return false;
-  }
 
   return true;
 };
 
-// Rutas para las p�ginas est�ticas
-app.get('/', (req, res) => {
-  renderIndex(res);
+const renderIndex = async (res) => {
+  const indexTemplate = path.join(__dirname, 'public', 'index.html');
+  const freeSpace = getDiskFreeSpace();
+  const fileCount = await getUploadedFileCount();
+
+  try {
+    const html = await fs.promises.readFile(indexTemplate, 'utf8');
+    const updatedHtml = html
+      .replace('{{FREE_SPACE}}', freeSpace === null ? 'N/D' : formatBytes(freeSpace))
+      .replace('{{FILE_COUNT}}', `${fileCount}`);
+
+    res.send(updatedHtml);
+  } catch (error) {
+    res.status(500).send('<h1>Error al cargar la pagina</h1>');
+  }
+};
+
+app.get('/', async (req, res) => {
+  await renderIndex(res);
 });
 
-app.get('/index.html', (req, res) => {
-  renderIndex(res);
+app.get('/index.html', async (req, res) => {
+  await renderIndex(res);
 });
 
 app.get('/login', (req, res) => {
@@ -200,34 +186,21 @@ app.get('/recover', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'subdomains', 'recover.html'));
 });
 
-app.get('/explore', (req, res) => {
+app.get('/explore', async (req, res) => {
   const exploreTemplate = path.join(__dirname, 'public', 'subdomains', 'explore.html');
-  const metadataFolder = path.join(__dirname, 'uploads', 'metadata');
   let cardsHtml = '';
 
-  if (fs.existsSync(metadataFolder)) {
-    const files = fs.readdirSync(metadataFolder).filter((file) => file.endsWith('.json'));
-    const sorted = files.sort((a, b) => {
-      const aId = Number.parseInt(path.basename(a, '.json'), 10);
-      const bId = Number.parseInt(path.basename(b, '.json'), 10);
-      return (Number.isNaN(bId) ? 0 : bId) - (Number.isNaN(aId) ? 0 : aId);
-    });
+  const entries = await db.all(
+    'SELECT id, created_at, title, description, category FROM entries ORDER BY datetime(created_at) DESC, id DESC'
+  );
 
-    cardsHtml = sorted.map((file) => {
-      const metadataPath = path.join(metadataFolder, file);
-      let metadata;
-      try {
-        metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-      } catch (error) {
-        return '';
-      }
-
-      const title = escapeHtml(metadata?.title || 'Sin t�tulo');
-      const description = escapeHtml(metadata?.description || '');
-      const category = escapeHtml(metadata?.category || 'otros');
-      const id = escapeHtml(metadata?.id || path.basename(file, '.json'));
-      const createdAtRaw = metadata?.createdAt || metadata?.id || path.basename(file, '.json');
-      const createdAt = escapeHtml(createdAtRaw);
+  if (entries.length > 0) {
+    cardsHtml = entries.map((entry) => {
+      const title = escapeHtml(entry.title || 'Sin titulo');
+      const description = escapeHtml(entry.description || '');
+      const category = escapeHtml(entry.category || 'otros');
+      const id = escapeHtml(entry.id);
+      const createdAt = escapeHtml(entry.created_at || entry.id);
 
       return `
             <div class="note-card" data-description="${description}" data-title="${title}" data-category="${category}" data-created="${createdAt}">
@@ -240,12 +213,12 @@ app.get('/explore', (req, res) => {
                 <p class="description">${description}</p>
             </div>
       `.trim();
-    }).filter(Boolean).join('\n');
+    }).join('\n');
   }
 
   if (!cardsHtml) {
     cardsHtml = `
-            <div class="note-card" data-description="No hay subidos a?n." data-title="" data-category="otros" data-created="0">
+            <div class="note-card" data-description="No hay subidos aun." data-title="" data-category="otros" data-created="0">
                 <a href="#" class="note-title">No hay archivos subidos</a>
 
                 <p class="description">Sube el primero desde la pagina de subida.</p>
@@ -253,23 +226,21 @@ app.get('/explore', (req, res) => {
     `.trim();
   }
 
-  fs.readFile(exploreTemplate, 'utf8', (err, html) => {
-    if (err) {
-      return res.status(500).send('<h1>Error al cargar la p�gina</h1>');
-    }
-
+  try {
+    const html = await fs.promises.readFile(exploreTemplate, 'utf8');
     const modifiedHtml = html.replace('<!-- NOTES_PLACEHOLDER -->', cardsHtml);
     res.send(modifiedHtml);
-  });
+  } catch (error) {
+    res.status(500).send('<h1>Error al cargar la pagina</h1>');
+  }
 });
 
 app.get('/upload', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'subdomains', 'upload.html'));
 });
 
-// Ruta para borrar un archivo completo
-app.post('/delete/:id', (req, res) => {
-  const deleted = removeEntry(req.params.id);
+app.post('/delete/:id', async (req, res) => {
+  const deleted = await removeEntry(req.params.id);
   if (!deleted) {
     return res.status(404).send('<h1>Archivo no encontrado</h1>');
   }
@@ -277,82 +248,85 @@ app.post('/delete/:id', (req, res) => {
   res.redirect('/explore');
 });
 
-// Ruta para borrar m�ltiples archivos
-app.post('/delete-batch', (req, res) => {
+app.post('/delete-batch', async (req, res) => {
   const idsRaw = req.body?.ids || '';
   const ids = idsRaw
     .split(',')
     .map((id) => id.trim())
     .filter(Boolean);
 
-  ids.forEach((id) => {
-    removeEntry(id);
-  });
+  for (const id of ids) {
+    await removeEntry(id);
+  }
 
   res.redirect('/explore');
 });
 
-// Ruta para procesar la subida de archivos
-app.post('/upload', (req, res) => {
-  upload.array('files', 15)(req, res, (err) => {
-    if (err) {
-      return res
-        .status(400)
-        .send(`<h1>Error al subir archivos</h1><p>${escapeHtml(err.message)}</p>`);
-    }
-
-    if (!req.files || req.files.length === 0) {
-      return res
-        .status(400)
-        .send('<h1>Hubo un error</h1><p>No se subieron archivos. Por favor, intent� de nuevo.</p>');
-    }
-
-    // Generar un ID �nico para la carga usando Date.now()
-    const uniqueId = Date.now().toString();
-
-    // Guardar la informaci�n de los archivos y metadatos
-    const metadata = {
-      id: uniqueId,
-      createdAt: new Date().toISOString(),
-      title: req.body.title || 'Sin t�tulo',
-      description: req.body.description || '',
-      category: (req.body.category || 'otros').toLowerCase(),
-      files: req.files.map((file) => ({
-        path: file.filename,
-        filename: file.originalname
-      }))
-    };
-
-    // Crear una carpeta para los metadatos si no existe
-    const metadataFolder = path.join(__dirname, 'uploads', 'metadata');
-    if (!fs.existsSync(metadataFolder)) {
-      fs.mkdirSync(metadataFolder, { recursive: true });
-    }
-
-    // Guardar el archivo JSON con los metadatos
-    const metadataFile = path.join(metadataFolder, `${uniqueId}.json`);
-    fs.writeFileSync(metadataFile, JSON.stringify(metadata, null, 2));
-
-    // Redirigir a la p�gina de publicaci�n
-    res.redirect(`/explore/${uniqueId}`);
-  });
-});
-
-// Ruta para mostrar los archivos p�blicos de un ID �nico
-app.get('/explore/:id', (req, res) => {
-  const metadataFile = path.join(
-    __dirname,
-    'uploads',
-    'metadata',
-    `${req.params.id}.json`
-  );
-
-  // Verificar si el archivo JSON de metadatos existe
-  if (!fs.existsSync(metadataFile)) {
-    return res.status(404).send('<h1>Archivo no encontrado</h1>');
+app.post('/upload', async (req, res) => {
+  try {
+    await new Promise((resolve, reject) => {
+      upload.array('files', 15)(req, res, (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      });
+    });
+  } catch (error) {
+    return res
+      .status(400)
+      .send(`<h1>Error al subir archivos</h1><p>${escapeHtml(error.message)}</p>`);
   }
 
-  const metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
+  if (!req.files || req.files.length === 0) {
+    return res
+      .status(400)
+      .send('<h1>Hubo un error</h1><p>No se subieron archivos. Por favor, intenta de nuevo.</p>');
+  }
+
+  const uniqueId = Date.now().toString();
+  const createdAt = new Date().toISOString();
+  const title = req.body.title || 'Sin titulo';
+  const description = req.body.description || '';
+  const category = String(req.body.category || 'otros').toLowerCase();
+
+  await db.run('BEGIN');
+  try {
+    await db.run(
+      'INSERT INTO entries (id, created_at, title, description, category) VALUES (?, ?, ?, ?, ?)',
+      uniqueId,
+      createdAt,
+      title,
+      description,
+      category
+    );
+
+    for (let index = 0; index < req.files.length; index += 1) {
+      const file = req.files[index];
+      await db.run(
+        'INSERT INTO entry_files (entry_id, file_path, file_name, sort_order) VALUES (?, ?, ?, ?)',
+        uniqueId,
+        file.filename,
+        file.originalname,
+        index
+      );
+    }
+
+    await db.run('COMMIT');
+  } catch (error) {
+    await db.run('ROLLBACK');
+    return res.status(500).send('<h1>Error al guardar la informacion</h1>');
+  }
+
+  res.redirect(`/explore/${uniqueId}`);
+});
+
+app.get('/explore/:id', async (req, res) => {
+  const metadata = await getEntryWithFiles(req.params.id);
+  if (!metadata) {
+    return res.status(404).send('<h1>Archivo no encontrado</h1>');
+  }
 
   const htmlTemplatePath = path.join(
     __dirname,
@@ -362,40 +336,41 @@ app.get('/explore/:id', (req, res) => {
     'plantillaResumenG.html'
   );
 
-  fs.readFile(htmlTemplatePath, 'utf8', (err, html) => {
-    if (err) {
-      return res.status(500).send('<h1>Error al cargar la plantilla</h1>');
+  let html;
+  try {
+    html = await fs.promises.readFile(htmlTemplatePath, 'utf8');
+  } catch (error) {
+    return res.status(500).send('<h1>Error al cargar la plantilla</h1>');
+  }
+
+  const safeTitle = escapeHtml(metadata.title || 'Sin titulo');
+  const safeDescription = escapeHtml(metadata.description || '');
+
+  let modifiedHtml = html
+    .replace(/<title>.*<\/title>/, `<title>${safeTitle}</title>`)
+    .replace(/<h2>.*<\/h2>/, `<h2>${safeTitle}</h2>`)
+    .replace(
+      /<p class="description">.*<\/p>/,
+      `<p class="description">${safeDescription}</p>`
+    )
+    .replace(
+      /<button[^>]*class="download-btn">Descargar<\/button>/,
+      `<button onclick="window.location.href='/download/${req.params.id}'" class="download-btn">Descargar todo</button>`
+    )
+    .replace(/\/delete\/ID/g, `/delete/${req.params.id}`);
+
+  const files = Array.isArray(metadata.files) ? metadata.files : [];
+  const fileListHtml = files.map((file, index) => {
+    const filePath = path.join(__dirname, 'uploads', file.path);
+    let fileSize = '';
+    try {
+      const stats = fs.statSync(filePath);
+      fileSize = formatBytes(stats.size);
+    } catch (error) {
+      fileSize = '';
     }
 
-    const safeTitle = escapeHtml(metadata.title || 'Sin t�tulo');
-    const safeDescription = escapeHtml(metadata.description || '');
-
-    // Modificar din�micamente la plantilla HTML
-    let modifiedHtml = html
-      .replace(/<title>.*<\/title>/, `<title>${safeTitle}</title>`)
-      .replace(/<h2>.*<\/h2>/, `<h2>${safeTitle}</h2>`)
-      .replace(
-        /<p class="description">.*<\/p>/,
-        `<p class="description">${safeDescription}</p>`
-      )
-      .replace(
-        /<button[^>]*class="download-btn">Descargar<\/button>/,
-        `<button onclick="window.location.href='/download/${req.params.id}'" class="download-btn">Descargar todo</button>`
-      )
-      .replace(/\/delete\/ID/g, `/delete/${req.params.id}`);
-
-    const files = Array.isArray(metadata.files) ? metadata.files : [];
-    const fileListHtml = files.map((file, index) => {
-      const filePath = path.join(__dirname, 'uploads', file.path);
-      let fileSize = '';
-      try {
-        const stats = fs.statSync(filePath);
-        fileSize = formatBytes(stats.size);
-      } catch (error) {
-        fileSize = '';
-      }
-
-      return `
+    return `
             <li class="file-item">
                 <div>
                     <span class="file-name">${escapeHtml(file.filename)}</span>
@@ -403,31 +378,21 @@ app.get('/explore/:id', (req, res) => {
                 </div>
                 <a href="/download/${req.params.id}/${index}" class="file-download">Descargar</a>
             </li>
-      `.trim();
-    }).join('\n');
+    `.trim();
+  }).join('\n');
 
-    const renderedList = fileListHtml || '<li class="file-item empty">No hay archivos disponibles.</li>';
-    modifiedHtml = modifiedHtml.replace('<!-- FILE_LIST_PLACEHOLDER -->', renderedList);
+  const renderedList = fileListHtml || '<li class="file-item empty">No hay archivos disponibles.</li>';
+  modifiedHtml = modifiedHtml.replace('<!-- FILE_LIST_PLACEHOLDER -->', renderedList);
 
-    // Enviar el HTML modificado al cliente
-    res.send(modifiedHtml);
-  });
+  res.send(modifiedHtml);
 });
 
-// Ruta para descargar un archivo individual
-app.get('/download/:id/:index', (req, res) => {
-  const metadataFile = path.join(
-    __dirname,
-    'uploads',
-    'metadata',
-    `${req.params.id}.json`
-  );
-
-  if (!fs.existsSync(metadataFile)) {
+app.get('/download/:id/:index', async (req, res) => {
+  const metadata = await getEntryWithFiles(req.params.id);
+  if (!metadata) {
     return res.status(404).send('<h1>Archivo no encontrado</h1>');
   }
 
-  const metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
   const files = Array.isArray(metadata.files) ? metadata.files : [];
   const index = Number.parseInt(req.params.index, 10);
   const fileEntry = files[index];
@@ -444,20 +409,12 @@ app.get('/download/:id/:index', (req, res) => {
   res.download(filePath, fileEntry.filename || path.basename(fileEntry.path));
 });
 
-// Ruta para descargar el archivo completo
-app.get('/download/:id', (req, res) => {
-  const metadataFile = path.join(
-    __dirname,
-    'uploads',
-    'metadata',
-    `${req.params.id}.json`
-  );
-
-  if (!fs.existsSync(metadataFile)) {
+app.get('/download/:id', async (req, res) => {
+  const metadata = await getEntryWithFiles(req.params.id);
+  if (!metadata) {
     return res.status(404).send('<h1>Archivo no encontrado</h1>');
   }
 
-  const metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
   const files = Array.isArray(metadata.files) ? metadata.files : [];
   const existingFiles = files.filter((file) => (
     file?.path && fs.existsSync(path.join(__dirname, 'uploads', file.path))
@@ -474,25 +431,18 @@ app.get('/download/:id', (req, res) => {
     fs.mkdirSync(path.join(__dirname, 'temp'), { recursive: true });
   }
 
-  // Crear el flujo de salida del archivo ZIP
   const output = fs.createWriteStream(zipPath);
   const archive = archiver('zip', {
     zlib: { level: 9 }
   });
 
-  // Manejo de eventos
   output.on('close', () => {
-    console.log(`Archivo ZIP generado: ${zipPath}`);
-    console.log(`Tama�o total: ${archive.pointer()} bytes`);
-
-    // Enviar el archivo ZIP al cliente
-    res.download(zipPath, zipFilename, (err) => {
-      if (err) {
-        console.error('Error al enviar el archivo:', err);
+    res.download(zipPath, zipFilename, (error) => {
+      if (error) {
+        console.error('Error al enviar el archivo:', error);
         res.status(500).send('<h1>Error al descargar el archivo</h1>');
       }
 
-      // Eliminar el archivo ZIP temporal despu�s de enviarlo
       try {
         fs.unlinkSync(zipPath);
       } catch (unlinkError) {
@@ -501,22 +451,20 @@ app.get('/download/:id', (req, res) => {
     });
   });
 
-  archive.on('warning', (err) => {
-    if (err.code === 'ENOENT') {
-      console.warn('Advertencia:', err);
+  archive.on('warning', (error) => {
+    if (error.code === 'ENOENT') {
+      console.warn('Advertencia:', error);
     } else {
-      throw err;
+      throw error;
     }
   });
 
-  archive.on('error', (err) => {
-    throw err;
+  archive.on('error', (error) => {
+    throw error;
   });
 
-  // Enlazar la salida al archivo ZIP
   archive.pipe(output);
 
-  // Agregar archivos al ZIP
   existingFiles.forEach((file, index) => {
     const originalName = file.filename || file.path;
     const safeName = `${index + 1}_${path.basename(originalName)}`;
@@ -526,14 +474,20 @@ app.get('/download/:id', (req, res) => {
     );
   });
 
-  // Finalizar el archivo ZIP
   archive.finalize();
 });
 
 app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Inicia el servidor en el puerto 3000
-app.listen(3000, () => {
-  console.log('Servidor corriendo en http://localhost:3000');
+const startServer = async () => {
+  db = await initDatabase();
+  app.listen(8080, () => {
+    console.log('Servidor corriendo en http://localhost:8080');
+  });
+};
+
+startServer().catch((error) => {
+  console.error('No se pudo iniciar el servidor:', error);
+  process.exit(1);
 });
