@@ -54,7 +54,6 @@ const createSchema = async (db) => {
 const initDatabase = async () => {
   const db = await getDb();
   await createSchema(db);
-  await migrateLegacyMetadata(db);
   return db;
 };
 
